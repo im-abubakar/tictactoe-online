@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Play Tic-Tac-Toe online with a friend using a room code.">
+<title>Tic-Tac-Toe Online</title>
+<style>
+  :root {
+    --bg: #eef3f0; --fg: #1d2b26; --muted: #5d6f68; --card: #ffffff; --line: #c9d6cf;
+    --x: #e8743b; --o: #2f8fd6; --accent: #5fbf5a; --accent-fg: #10231a;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14201c; --fg: #e6efe9; --muted: #93a79e; --card: #1c2c27; --line: #31453d; --x: #ff9d6b; --o: #5cb6ff; color-scheme: dark; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+  }
+  main { width: min(100%, 380px); display: flex; flex-direction: column; gap: 14px; align-items: stretch; text-align: center; }
+  h1 { margin: 0; font-size: 1.5rem; }
+  section { background: var(--card); border: 2px solid var(--line); border-radius: 16px; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+  section[hidden] { display: none; }
+  p { margin: 0; color: var(--muted); font-size: .9rem; }
+  button, input {
+    font: inherit; color: var(--fg); background: transparent; border: 2px solid var(--fg); border-radius: 10px; padding: 9px 14px;
+  }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { background: color-mix(in srgb, var(--fg) 10%, transparent); }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  button:disabled { cursor: default; }
+  button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 700; }
+  form { display: flex; gap: 8px; }
+  input { flex: 1; min-width: 0; text-align: center; text-transform: uppercase; letter-spacing: .3em; font-weight: 700; font-size: 1.1rem; }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: .9rem; }
+  .code { font-family: ui-monospace, monospace; font-weight: 700; letter-spacing: .15em; font-size: 1.1rem; }
+  .you b { padding: 2px 9px; border-radius: 8px; border: 2px solid currentColor; }
+  .x { color: var(--x); } .o { color: var(--o); }
+  #status { color: var(--fg); font-weight: 700; font-size: 1.1rem; min-height: 1.5em; }
+  .board { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .cell {
+    aspect-ratio: 1; font-size: clamp(2rem, 14vw, 3.4rem); font-weight: 800; line-height: 1; padding: 0;
+    border-color: var(--line); background: var(--bg);
+  }
+  .cell:not(:disabled):hover { border-color: var(--fg); }
+  .cell.win { background: color-mix(in srgb, var(--accent) 30%, transparent); border-color: var(--accent); }
+  #msg { min-height: 1.2em; color: #d64545; font-size: .88rem; }
+  #conn { font-size: .78rem; text-align: center; }
+  @media (prefers-reduced-motion: no-preference) { .cell.pop { animation: pop .18s ease-out; } @keyframes pop { from { transform: scale(.6); } to { transform: scale(1); } } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tic-Tac-Toe Online</h1>
+
+  <section id="lobby">
+    <button id="create" class="primary" type="button" disabled>Create a game</button>
+    <p>or join a friend's game with their 4-letter code</p>
+    <form id="joinForm">
+      <input id="code" maxlength="4" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD" aria-label="Room code">
+      <button type="submit" id="joinBtn" disabled>Join</button>
+    </form>
+    <div id="lobbyMsg" class="msg" role="alert"></div>
+  </section>
+
+  <section id="game" hidden>
+    <div class="row"><span class="you">You are <b id="you">?</b></span><span>Room <span class="code" id="room"></span></span></div>
+    <div id="status" aria-live="polite"></div>
+    <div class="board" id="board" role="grid" aria-label="Tic-Tac-Toe board"></div>
+    <div id="msg" role="alert"></div>
+    <div class="row"><button id="share" type="button">Copy invite link</button><button id="leave" type="button">Leave game</button></div>
+  </section>
+
+  <p id="conn">Connecting…</p>
+</main>
+
+<script>
+// The client is deliberately "dumb": it sends what the player wants to do, and draws whatever the server says is true.
+const $ = id => document.getElementById(id);
+let ws = null, state = null, autoJoinTried = false, prevBoard = Array(9).fill(null);
+
+// ----- Build the 3x3 board once -----
+const cells = [];
+for (let i = 0; i < 9; i++) {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'cell'; b.setAttribute('aria-label', 'Cell ' + (i + 1) + ', empty');
+  b.addEventListener('click', () => send({ type: 'move', cell: i }));     // we only REQUEST a move; the server decides
+  $('board').appendChild(b); cells.push(b);
+}
+
+// ----- Connection -----
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(proto + '://' + location.host);
+  ws.onopen = () => {
+    $('conn').textContent = 'Connected';
+    $('create').disabled = false; $('joinBtn').disabled = false;
+    const invite = new URLSearchParams(location.search).get('room');      // opened via an invite link? join automatically
+    if (invite && !autoJoinTried) { autoJoinTried = true; send({ type: 'join', code: invite }); }
+  };
+  ws.onmessage = e => { let m; try { m = JSON.parse(e.data); } catch { return; } handle(m); };
+  ws.onclose = () => {
+    $('conn').textContent = 'Disconnected from the server. Reload the page to reconnect.';
+    $('create').disabled = true; $('joinBtn').disabled = true;
+    state = null; showLobby('Connection lost.');
+  };
+}
+function send(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
+
+function handle(m) {
+  if (m.type === 'state') { state = m; showGame(); render(); }
+  else if (m.type === 'error') { (state ? $('msg') : $('lobbyMsg')).textContent = m.message; }
+  else if (m.type === 'opponent_left') { state = null; showLobby('Your opponent left the game.'); }
+}
+
+// ----- Views -----
+function showLobby(message = '') {
+  $('lobby').hidden = false; $('game').hidden = true; $('lobbyMsg').textContent = message; $('lobbyMsg').style.color = '#d64545';
+  prevBoard = Array(9).fill(null);
+}
+function showGame() { $('lobby').hidden = true; $('game').hidden = false; }
+
+function render() {
+  const s = state;
+  $('you').textContent = s.you; $('you').parentElement.className = 'you ' + s.you.toLowerCase();
+  $('room').textContent = s.code; $('msg').textContent = '';
+  const myTurn = s.status === 'playing' && s.turn === s.you;
+  $('status').textContent =
+    s.status === 'waiting' ? 'Waiting for an opponent… share the code or the invite link.' :
+    s.status === 'playing' ? (myTurn ? 'Your turn' : "Opponent's turn…") :
+    s.status === 'draw' ? "It's a draw!" : (s.winner === s.you ? 'You win! 🎉' : 'You lose.');
+  s.board.forEach((v, i) => {
+    const c = cells[i];
+    c.textContent = v || ''; c.className = 'cell' + (v ? ' ' + v.toLowerCase() : '') + (s.line && s.line.includes(i) ? ' win' : '') + (v && !prevBoard[i] ? ' pop' : '');
+    c.disabled = !(myTurn && !v);                                  // the real check is on the server; this is just a UI hint
+    c.setAttribute('aria-label', 'Cell ' + (i + 1) + ', ' + (v || 'empty'));
+  });
+  prevBoard = s.board.slice();
+}
+
+// ----- Buttons -----
+$('create').onclick = () => { $('lobbyMsg').textContent = ''; send({ type: 'create' }); };
+$('joinForm').onsubmit = e => { e.preventDefault(); $('lobbyMsg').textContent = ''; send({ type: 'join', code: $('code').value }); };
+$('leave').onclick = () => { send({ type: 'leave' }); state = null; history.replaceState(null, '', location.pathname); showLobby(); };
+$('share').onclick = async () => {
+  const link = location.origin + location.pathname + '?room=' + state.code;
+  try { await navigator.clipboard.writeText(link); $('share').textContent = 'Copied!'; }
+  catch { $('share').textContent = 'Code: ' + state.code; }
+  setTimeout(() => { $('share').textContent = 'Copy invite link'; }, 1800);
+};
+
+connect();
+</script>
+</body>
+</html>
